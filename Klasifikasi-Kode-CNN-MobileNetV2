@@ -1,0 +1,533 @@
+# Pembangunan Model Klasifikasi Wadah Sekali Pakai dengan Arsitektur Mobilenetv2 Berbasis Image Processing
+
+## PENDAHULUAN
+Di era modern ini, masalah lingkungan menjadi perhatian utama global. Salah satu aspek penting dalam pelestarian lingkungan adalah pengelolaan sampah dan daur ulang. Wadah sekali pakai, seperti botol plastik, kemasan makanan, dan wadah minuman, merupakan kontributor signifikan terhadap volume sampah yang dihasilkan setiap hari. Dampak negatifnya terhadap lingkungan dapat diminimalisir melalui pemisahan dan daur ulang yang efektif
+
+
+
+
+
+### Ambil data dari kaggle dataset
+
+
+# IMPORTANT: RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES
+# TO THE CORRECT LOCATION (/kaggle/input) IN YOUR NOTEBOOK,
+# THEN FEEL FREE TO DELETE THIS CELL.
+# NOTE: THIS NOTEBOOK ENVIRONMENT DIFFERS FROM KAGGLE'S PYTHON
+# ENVIRONMENT SO THERE MAY BE MISSING LIBRARIES USED BY YOUR
+# NOTEBOOK.
+
+import os
+import sys
+from tempfile import NamedTemporaryFile
+from urllib.request import urlopen
+from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError
+from zipfile import ZipFile
+import tarfile
+import shutil
+
+CHUNK_SIZE = 40960
+DATA_SOURCE_MAPPING = 'plastic-paper-garbage-bag-synthetic-images:https%3A%2F%2Fstorage.googleapis.com%2Fkaggle-data-sets%2F2437189%2F4123821%2Fbundle%2Farchive.zip%3FX-Goog-Algorithm%3DGOOG4-RSA-SHA256%26X-Goog-Credential%3Dgcp-kaggle-com%2540kaggle-161607.iam.gserviceaccount.com%252F20240607%252Fauto%252Fstorage%252Fgoog4_request%26X-Goog-Date%3D20240607T020732Z%26X-Goog-Expires%3D259200%26X-Goog-SignedHeaders%3Dhost%26X-Goog-Signature%3D265f96bb0c796e56557de058cc06e829c232e682bc6be6474de3fbb80423f11bbb660f5eb34b93f7c3f9e7a8bc3a784e51069e1c7665b6671b07b98100c7b5edbe0c33e3274a73f9d1acac26057af3ae0662be2ee3e2dba282c64263d29d54392bfc3fc5032484d64416875ef8cbb8a8e841df574a69184e9574fb58950ab0e88bbd9f9fbf34c27e2b4cf20851270f1619a6c4ac066a6fd11f04fb8525e79972ef232e8885d819e507a97f9b393d692b724476ff6f4dca149b5dfc1e7b8b9f9fbd5b7825b3205ca40aeb286ace617a84e42651140bae02fa8086222182b31c58f73952d3ab4c963873bc645ed40c87abb9cc312b8a3d96eba957f2790b871f5b'
+
+KAGGLE_INPUT_PATH='/kaggle/input'
+KAGGLE_WORKING_PATH='/kaggle/working'
+KAGGLE_SYMLINK='kaggle'
+
+!umount /kaggle/input/ 2> /dev/null
+shutil.rmtree('/kaggle/input', ignore_errors=True)
+os.makedirs(KAGGLE_INPUT_PATH, 0o777, exist_ok=True)
+os.makedirs(KAGGLE_WORKING_PATH, 0o777, exist_ok=True)
+
+try:
+  os.symlink(KAGGLE_INPUT_PATH, os.path.join("..", 'input'), target_is_directory=True)
+except FileExistsError:
+  pass
+try:
+  os.symlink(KAGGLE_WORKING_PATH, os.path.join("..", 'working'), target_is_directory=True)
+except FileExistsError:
+  pass
+
+for data_source_mapping in DATA_SOURCE_MAPPING.split(','):
+    directory, download_url_encoded = data_source_mapping.split(':')
+    download_url = unquote(download_url_encoded)
+    filename = urlparse(download_url).path
+    destination_path = os.path.join(KAGGLE_INPUT_PATH, directory)
+    try:
+        with urlopen(download_url) as fileres, NamedTemporaryFile() as tfile:
+            total_length = fileres.headers['content-length']
+            print(f'Downloading {directory}, {total_length} bytes compressed')
+            dl = 0
+            data = fileres.read(CHUNK_SIZE)
+            while len(data) > 0:
+                dl += len(data)
+                tfile.write(data)
+                done = int(50 * dl / int(total_length))
+                sys.stdout.write(f"\r[{'=' * done}{' ' * (50-done)}] {dl} bytes downloaded")
+                sys.stdout.flush()
+                data = fileres.read(CHUNK_SIZE)
+            if filename.endswith('.zip'):
+              with ZipFile(tfile) as zfile:
+                zfile.extractall(destination_path)
+            else:
+              with tarfile.open(tfile.name) as tarfile:
+                tarfile.extractall(destination_path)
+            print(f'\nDownloaded and uncompressed: {directory}')
+    except HTTPError as e:
+        print(f'Failed to load (likely expired) {download_url} to path {destination_path}')
+        continue
+    except OSError as e:
+        print(f'Failed to load {download_url} to path {destination_path}')
+        continue
+
+print('Data source import complete.')
+
+
+# Import Libraries
+
+# Import Data Science Libraries
+!pip install keras-preprocessing
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+
+# Tensorflow Libraries
+from tensorflow import keras
+from tensorflow.keras import layers,models
+from keras_preprocessing.image import ImageDataGenerator
+from keras.layers import Dense, Dropout
+from tensorflow.keras.callbacks import Callback, EarlyStopping,ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras import Model
+from tensorflow.keras.layers.experimental import preprocessing
+
+# System libraries
+from pathlib import Path
+import os.path
+
+# Metrics
+from sklearn.metrics import classification_report, confusion_matrix
+import itertools
+
+# Buat Fungsi Bantuan
+
+
+!wget https://raw.githubusercontent.com/mrdbourke/tensorflow-deep-learning/main/extras/helper_functions.py
+
+# Import series of helper functions for our notebook
+from helper_functions import create_tensorboard_callback, plot_loss_curves, unzip_data, compare_historys, walk_through_dir, pred_and_plot
+
+# Masukkan dan Transformasi Data
+
+BATCH_SIZE = 32
+IMAGE_SIZE = (300, 300)
+
+# Walk through each directory
+dataset = "../input/plastic-paper-garbage-bag-synthetic-images/Bag Classes"
+walk_through_dir(dataset)
+
+# 📅Menempatkan Data ke dalam Dataframe
+Kolom pertama 'jalur file' berisi lokasi jalur file dari masing-masing gambar. Kolom kedua `label`, di sisi lain, berisi label kelas dari gambar yang sesuai dari jalur file
+
+image_dir = Path(dataset)
+
+# Get filepaths and labels
+filepaths = list(image_dir.glob(r'**/*.JPG')) + list(image_dir.glob(r'**/*.jpg')) + list(image_dir.glob(r'**/*.png')) + list(image_dir.glob(r'**/*.png'))
+
+labels = list(map(lambda x: os.path.split(os.path.split(x)[0])[1], filepaths))
+
+filepaths = pd.Series(filepaths, name='Filepath').astype(str)
+labels = pd.Series(labels, name='Label')
+
+# Concatenate filepaths and labels
+image_df = pd.concat([filepaths, labels], axis=1)
+
+image_df
+
+# 🔭Visualizing images from the dataset
+
+# Display 16 picture of the dataset with their labels
+random_index = np.random.randint(0, len(image_df), 16)
+fig, axes = plt.subplots(nrows=4, ncols=4, figsize=(10, 10),
+                        subplot_kw={'xticks': [], 'yticks': []})
+
+for i, ax in enumerate(axes.flat):
+    ax.imshow(plt.imread(image_df.Filepath[random_index[i]]))
+    ax.set_title(image_df.Label[random_index[i]])
+plt.tight_layout()
+plt.show()
+
+# Prapemrosesan Data
+Data akan dibagi menjadi tiga kategori berbeda: Pelatihan, Validasi, dan Pengujian. Data pelatihan akan digunakan untuk melatih model CNN pembelajaran mendalam dan parameternya akan disesuaikan dengan data validasi. Terakhir, kinerja data akan dievaluasi menggunakan data uji (data yang belum pernah dilihat model sebelumnya).
+
+# Separate in train and test data
+train_df, test_df = train_test_split(image_df, test_size=0.2, shuffle=True, random_state=42)
+
+train_generator = ImageDataGenerator(
+    preprocessing_function=tf.keras.applications.mobilenet_v2.preprocess_input,
+    validation_split=0.2
+)
+
+test_generator = ImageDataGenerator(
+    preprocessing_function=tf.keras.applications.mobilenet_v2.preprocess_input
+)
+
+# Split the data into three categories.
+train_images = train_generator.flow_from_dataframe(
+    dataframe=train_df,
+    x_col='Filepath',
+    y_col='Label',
+    target_size=(224, 224),
+    color_mode='rgb',
+    class_mode='categorical',
+    batch_size=32,
+    shuffle=True,
+    seed=42,
+    subset='training'
+)
+
+val_images = train_generator.flow_from_dataframe(
+    dataframe=train_df,
+    x_col='Filepath',
+    y_col='Label',
+    target_size=(224, 224),
+    color_mode='rgb',
+    class_mode='categorical',
+    batch_size=32,
+    shuffle=True,
+    seed=42,
+    subset='validation'
+)
+
+test_images = test_generator.flow_from_dataframe(
+    dataframe=test_df,
+    x_col='Filepath',
+    y_col='Label',
+    target_size=(224, 224),
+    color_mode='rgb',
+    class_mode='categorical',
+    batch_size=32,
+    shuffle=False
+)
+
+# Resize Layer
+resize_and_rescale = tf.keras.Sequential([
+  layers.experimental.preprocessing.Resizing(224,224),
+  layers.experimental.preprocessing.Rescaling(1./255),
+])
+
+# Melatih Model
+Model gambar akan menggunakan model CNN yang telah dilatih sebelumnya yang disebut Mobile Net V2. Tiga callback akan digunakan untuk memantau pelatihan. Ini adalah: Model Checkpoint, Early Stopping, Tensorboard callback. Ringkasan model hyperparameter ditampilkan sebagai berikut:
+
+**Batch size** : 32
+
+**Epochs** : 100
+
+**Input Shape** : (300, 300, 3)
+
+**Output layer** : 5
+
+
+
+# Load the pretained model
+pretrained_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224, 224, 3),
+    include_top=False,
+    weights='imagenet',
+    pooling='avg'
+)
+
+pretrained_model.trainable = False
+
+# Create checkpoint callback
+checkpoint_path = "bags_classification_model_checkpoint"
+checkpoint_callback = ModelCheckpoint(checkpoint_path,
+                                      save_weights_only=True,
+                                      monitor="val_accuracy",
+                                      save_best_only=True)
+
+# Setup EarlyStopping callback to stop training if model's val_loss doesn't improve for 3 epochs
+early_stopping = EarlyStopping(monitor = "val_loss", # watch the val loss metric
+                               patience = 5,
+                               restore_best_weights = True) # if val loss decreases for 3 epochs in a row, stop training
+
+# Latihan Model
+
+inputs = pretrained_model.input
+x = resize_and_rescale(inputs)
+
+x = Dense(256, activation='relu')(pretrained_model.output)
+x = Dropout(0.2)(x)
+x = Dense(256, activation='relu')(x)
+x = Dropout(0.2)(x)
+
+
+outputs = Dense(3, activation='softmax')(x)
+
+model = Model(inputs=inputs, outputs=outputs)
+
+model.compile(
+    optimizer=Adam(0.0001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+history = model.fit(
+    train_images,
+    steps_per_epoch=len(train_images),
+    validation_data=val_images,
+    validation_steps=len(val_images),
+    epochs=100,
+    callbacks=[
+        early_stopping,
+        create_tensorboard_callback("training_logs",
+                                    "bag_classification"),
+        checkpoint_callback,
+    ]
+)
+
+# Evaluasi Model
+Kumpulan data pengujian akan digunakan untuk mengevaluasi kinerja model.Salah satu metrik yang akan diuji adalah akurasi yang mengukur fraksi prediksi yang diperoleh model dengan benar. Metrik lainnya adalah sebagai berikut:
+
+**Precision(P)**:
+Fraksi positif sejati (TP, prediksi yang benar) dari jumlah total hasil yang relevan, yaitu jumlah TP dan positif palsu (FP). Untuk masalah klasifikasi multi-kelas, P dirata-ratakan di antara kelas-kelas tersebut. Berikut ini adalah rumus untuk precision.
+
+<center>$P=TP/(TP+FP)$</center>
+
+**Recall(R)**:
+Fraksi TP dari jumlah total TP dan negatif palsu (FN). Untuk masalah klasifikasi multi-kelas, R dirata-ratakan di antara semua kelas. Berikut ini adalah rumus untuk recall.
+<center>$R=TP/(TP+FN)$</center>
+
+**F1 score(F1)**:
+Rata-rata harmonik presisi dan penarikan kembali. Untuk masalah klasifikasi multi-kelas, F1 dirata-ratakan di antara semua kelas. Berikut ini adalah rumus untuk F1 score.
+<center>$F1=2 * (TP * FP)/(TP+FP)$</center>
+
+
+
+results = model.evaluate(test_images, verbose=0)
+
+print("    Test Loss: {:.5f}".format(results[0]))
+print("Test Accuracy: {:.2f}%".format(results[1] * 100))
+
+# Memvisualisasikan loss curves
+
+plot_loss_curves(history)
+
+# Membuat Prediksi pada Tes Data
+
+# Predict the label of the test_images
+pred = model.predict(test_images)
+pred = np.argmax(pred,axis=1)
+
+# Map the label
+labels = (train_images.class_indices)
+labels = dict((v,k) for k,v in labels.items())
+pred = [labels[k] for k in pred]
+
+# Display the result
+print(f'The first 5 predictions: {pred[:5]}')
+
+  # Display 25 random pictures from the dataset with their labels
+random_index = np.random.randint(0, len(test_df) - 1, 15)
+fig, axes = plt.subplots(nrows=3, ncols=5, figsize=(25, 15),
+                        subplot_kw={'xticks': [], 'yticks': []})
+
+for i, ax in enumerate(axes.flat):
+    ax.imshow(plt.imread(test_df.Filepath.iloc[random_index[i]]))
+    if test_df.Label.iloc[random_index[i]] == pred[random_index[i]]:
+      color = "green"
+    else:
+      color = "red"
+    ax.set_title(f"True: {test_df.Label.iloc[random_index[i]]}\nPredicted: {pred[random_index[i]]}", color=color)
+plt.show()
+plt.tight_layout()
+
+# Merencanakan Hasil Klasifikasi dan Confusion Matrix
+
+y_test = list(test_df.Label)
+print(classification_report(y_test, pred))
+
+report = classification_report(y_test, pred, output_dict=True)
+df = pd.DataFrame(report).transpose()
+df
+
+# @title precision
+
+from matplotlib import pyplot as plt
+df['precision'].plot(kind='line', figsize=(8, 4), title='precision')
+plt.gca().spines[['top', 'right']].set_visible(False)
+
+# @title recall
+
+from matplotlib import pyplot as plt
+df['recall'].plot(kind='line', figsize=(8, 4), title='recall')
+plt.gca().spines[['top', 'right']].set_visible(False)
+
+# @title f1-score
+
+from matplotlib import pyplot as plt
+df['f1-score'].plot(kind='line', figsize=(8, 4), title='f1-score')
+plt.gca().spines[['top', 'right']].set_visible(False)
+
+# @title support
+
+from matplotlib import pyplot as plt
+df['support'].plot(kind='line', figsize=(8, 4), title='support')
+plt.gca().spines[['top', 'right']].set_visible(False)
+
+def make_confusion_matrix(y_true, y_pred, classes=None, figsize=(15, 7), text_size=10, norm=False, savefig=False):
+    """Makes a labelled confusion matrix comparing predictions and ground truth labels.
+
+    If classes is passed, confusion matrix will be labelled, if not, integer class values
+  will be used.
+
+  Args:
+    y_true: Array of truth labels (must be same shape as y_pred).
+    y_pred: Array of predicted labels (must be same shape as y_true).
+    classes: Array of class labels (e.g. string form). If `None`, integer labels are used.
+    figsize: Size of output figure (default=(10, 10)).
+    text_size: Size of output figure text (default=15).
+    norm: normalize values or not (default=False).
+    savefig: save confusion matrix to file (default=False).
+
+  Returns:
+    A labelled confusion matrix plot comparing y_true and y_pred.
+
+  Example usage:
+    make_confusion_matrix(y_true=test_labels, # ground truth test labels
+                          y_pred=y_preds, # predicted labels
+                          classes=class_names, # array of class label names
+                          figsize=(15, 15),
+                          text_size=10)
+    """
+  # Create the confustion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    cm_norm = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis] # normalize it
+    n_classes = cm.shape[0] # find the number of classes we're dealing with
+
+    # Plot the figure and make it pretty
+    fig, ax = plt.subplots(figsize=figsize)
+    cax = ax.matshow(cm, cmap=plt.cm.Blues) # colors will represent how 'correct' a class is, darker == better
+    fig.colorbar(cax)
+
+    # Are there a list of classes?
+    if classes:
+        labels = classes
+    else:
+        labels = np.arange(cm.shape[0])
+
+    # Label the axes
+    ax.set(title="Confusion Matrix",
+         xlabel="Predicted label",
+         ylabel="True label",
+         xticks=np.arange(n_classes), # create enough axis slots for each class
+         yticks=np.arange(n_classes),
+         xticklabels=labels, # axes will labeled with class names (if they exist) or ints
+         yticklabels=labels)
+
+    # Make x-axis labels appear on bottom
+    ax.xaxis.set_label_position("bottom")
+    ax.xaxis.tick_bottom()
+    ### Added: Rotate xticks for readability & increase font size (required due to such a large confusion matrix)
+    plt.xticks(rotation=90, fontsize=text_size)
+    plt.yticks(fontsize=text_size)
+
+    # Set the threshold for different colors
+    threshold = (cm.max() + cm.min()) / 2.
+
+    # Plot the text on each cell
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        if norm:
+            plt.text(j, i, f"{cm[i, j]} ({cm_norm[i, j]*100:.1f}%)",
+                horizontalalignment="center",
+                color="white" if cm[i, j] > threshold else "black",
+                size=text_size)
+        else:
+            plt.text(j, i, f"{cm[i, j]}",
+              horizontalalignment="center",
+              color="white" if cm[i, j] > threshold else "black",
+              size=text_size)
+
+  # Save the figure to the current working directory
+    if savefig:
+        fig.savefig("confusion_matrix.png")
+
+
+make_confusion_matrix(y_test, pred, list(labels.values()))
+
+# CNN biasa
+
+
+inputs = pretrained_model.input
+x = resize_and_rescale(inputs)
+x = layers.Conv2D(filters=10,
+                         kernel_size=3,
+                         activation="relu")(x)
+x = layers.MaxPool2D(pool_size=2,
+                            padding="valid")(x)
+x = layers.Conv2D(filters=10,
+                         kernel_size=3,
+                         activation="relu")(x)
+x = layers.MaxPool2D(pool_size=2,
+                            padding="valid")(x)
+
+x = layers.Conv2D(filters=10,
+                         kernel_size=3,
+                         activation="relu")(x)
+x = layers.MaxPool2D(pool_size=2,
+                            padding="valid")(x)
+x = layers.GlobalAveragePooling2D(name="global_average_pooling_2D")(x)
+x = Dense(256, activation='relu')(pretrained_model.output)
+x = Dropout(0.2)(x)
+x = Dense(256, activation='relu')(x)
+x = Dropout(0.2)(x)
+
+outputs = Dense(3, activation='softmax')(x)
+
+model = Model(inputs=inputs, outputs=outputs)
+
+model.compile(
+    optimizer=Adam(0.0001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+history_1 = model.fit(train_images,
+                    epochs=9,
+                    validation_data=val_images)
+
+inputs = pretrained_model.input
+x = resize_and_rescale(inputs)
+
+x = Dense(256, activation='relu')(pretrained_model.output)
+x = Dropout(0.2)(x)
+x = Dense(256, activation='relu')(x)
+x = Dropout(0.2)(x)
+
+
+outputs = Dense(3, activation='softmax')(x)
+
+model = Model(inputs=inputs, outputs=outputs)
+
+model.compile(
+    optimizer=Adam(0.0001),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+history = model.fit(
+    train_images,
+    steps_per_epoch=len(train_images),
+    validation_data=val_images,
+    validation_steps=len(val_images),
+    epochs=100,
+    callbacks=[
+        early_stopping,
+        create_tensorboard_callback("training_logs",
+                                    "bag_classification"),
+        checkpoint_callback,
+    ]
+)
